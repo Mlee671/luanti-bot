@@ -14,7 +14,7 @@ bot = Bot(os.environ.get("LUANTI_HOST", "127.0.0.1"),
 bot.connect()
 bot.wait(15)
 
-targets = bot.find_blocks(wanted, radius=24)
+targets = bot.find_blocks(wanted, radius=64)
 print(f"found {len(targets)} x {wanted}")
 if not targets:
     bot.disconnect(); raise SystemExit("none nearby")

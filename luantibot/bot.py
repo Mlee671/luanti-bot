@@ -32,7 +32,7 @@ class BotError(Exception):
 
 class Bot:
     def __init__(self, host, port=30000, username="bot", password="",
-                 verbose=False, view_range=12, **pathfinder_opts):
+                 verbose=False, view_range=12, dig_through=False, **pathfinder_opts):
         self.client = LuantiClient(host, port, username, password, verbose=verbose)
         self.client.wanted_range = view_range
         self.verbose = verbose
@@ -41,6 +41,8 @@ class Bot:
         self.listeners = {}
         self.walk_speed = DEFAULT_WALK_SPEED
         self.reach = DEFAULT_REACH
+        # when walking cannot get somewhere, mine a way there instead
+        self.dig_through = dig_through
         # The server ignores any interact whose item index is outside the
         # hotbar, so tools must be moved into it before they can be used.
         self.hotbar_size = 9
@@ -239,10 +241,25 @@ class Bot:
             raise BotError("not connected")
         return self.pathfinder.find_path(self.node_pos, goal, tolerance=tolerance)
 
-    def goto(self, goal, tolerance=0, timeout=120.0, replan=True):
-        """Walk to a node position. Returns True if the goal was reached."""
+    def goto(self, goal, tolerance=0, timeout=120.0, replan=True, dig=None):
+        """Walk to a node position. Returns True if the goal was reached.
+
+        If walking fails and `dig` (default: the bot's `dig_through`) is set,
+        mine a way there with `tunnel_to` for whatever time remains.
+        """
         goal = tuple(int(v) for v in goal)
         deadline = time.monotonic() + timeout
+        if self._walk_to(goal, tolerance, deadline, replan):
+            return True
+        if dig if dig is not None else self.dig_through:
+            remaining = deadline - time.monotonic()
+            if remaining > 5:
+                h = self.pathfinder.heuristic
+                return self.tunnel_to(goal, lambda: h(self.node_pos, goal) <= tolerance,
+                                      timeout=remaining)
+        return False
+
+    def _walk_to(self, goal, tolerance, deadline, replan):
         attempts = 0
         stalled = 0
         last_progress = math.inf
@@ -342,9 +359,12 @@ class Bot:
                         spots.append((abs(dx) + abs(dy) + abs(dz), cand))
         spots.sort()
         for _d, spot in spots[:12]:
-            if self.goto(spot, tolerance=1, timeout=timeout, replan=False):
+            if self.goto(spot, tolerance=1, timeout=timeout, replan=False, dig=False):
                 if self.in_reach(pos):
                     return True
+        if not self.in_reach(pos) and self.dig_through:
+            # buried (ore under dirt, say): no spot to stand on is reachable
+            return self.tunnel_to(pos, lambda: self.in_reach(pos), timeout=timeout)
         return self.in_reach(pos)
 
     # --------------------------------------------------------- tools and digging
@@ -447,7 +467,7 @@ class Bot:
         against = tuple(int(v) for v in against)
         above = (against[0] + face[0], against[1] + face[1], against[2] + face[2])
         if slot is not None:
-            self.client.select_slot(slot)
+            self.equip(slot)
         self.look_at(against)
         self.client.interact(INTERACT_PLACE, against, above)
         self.step()
@@ -551,8 +571,8 @@ class Bot:
         if not self.in_reach(pos) and not self.approach(pos):
             raise BotError(f"{pos} is out of reach ({self.distance_to(pos):.1f} nodes)")
         if slot is not None:
-            self.select_slot(slot)
-            self.step()
+            # the server ignores items outside the hotbar, so bring it in first
+            slot = self.equip(slot)
 
         for face in ((0, -1, 0), (0, 1, 0), (1, 0, 0), (-1, 0, 0),
                      (0, 0, 1), (0, 0, -1)):
@@ -722,6 +742,86 @@ class Bot:
         # we now fall one node into the hole
         return self.wait_for(lambda: self.node_pos[1] <= p[1] - 1, timeout=6.0)
 
+    def _clear(self, nodes):
+        """Dig out every solid node in `nodes`; False if any cannot be cleared."""
+        for node in nodes:
+            if not self.world.is_walkable(node):
+                continue
+            if not self._opening_is_safe(node) or not self.can_dig(node):
+                return False
+            try:
+                if not self.dig(node, approach=False):
+                    return False
+            except BotError:
+                return False
+        return True
+
+    def tunnel_to(self, goal, done, timeout=120.0):
+        """Mine a direct route toward `goal` until `done()` returns True.
+
+        For when walking cannot get there -- typically a target buried under
+        dirt or stone. Each step cuts a two-node opening (feet and head) one
+        node toward the goal, stepping down, level or up as the goal requires,
+        then walks into it. Like `mine_to_depth` it never opens a face next to
+        lava or water and only steps where there is a floor.
+
+        Returns `done()` at the end.
+        """
+        goal = tuple(int(v) for v in goal)
+        deadline = time.monotonic() + timeout
+        sign = lambda v: (v > 0) - (v < 0)
+        stuck = 0
+
+        while time.monotonic() < deadline and not done():
+            if self.dead:
+                return False
+            self.settle(timeout=5.0)
+            x, y, z = p = self.node_pos
+            gx, gy, gz = goal
+            dy = sign(gy - y)
+
+            # headings toward the goal first (larger axis leads), then the rest
+            ax, az = gx - x, gz - z
+            toward = [(sign(ax), 0), (0, sign(az))]
+            if abs(az) > abs(ax):
+                toward.reverse()
+            headings = [h for h in toward if h != (0, 0)]
+            headings += [h for h in self.HEADINGS if h not in headings]
+
+            advanced = False
+            if dy < 0 and not ax and not az:
+                advanced = self._dig_down_one(p)         # goal straight below
+            for hx, hz in ([] if advanced else headings):
+                tx, tz = x + hx, z + hz
+                if dy < 0:                               # stair down
+                    feet = (tx, y - 1, tz)
+                    cut = [(tx, y + 1, tz), (tx, y, tz), feet]
+                elif dy > 0:                             # stair up
+                    feet = (tx, y + 1, tz)
+                    cut = [(x, y + 2, z), (tx, y + 2, tz), feet]
+                else:                                    # level tunnel
+                    feet = (tx, y, tz)
+                    cut = [(tx, y + 1, tz), feet]
+                floor = self.world.get_def((feet[0], feet[1] - 1, feet[2]))
+                if floor is None or not floor.walkable:
+                    continue                             # nothing to stand on
+                if not self._clear(cut):
+                    continue
+                if self.goto(feet, tolerance=0, timeout=15, replan=False, dig=False):
+                    advanced = True
+                    break
+
+            if advanced:
+                stuck = 0
+                self.emit("tunnel_step", self.node_pos)
+            else:
+                stuck += 1
+                if stuck >= 3:
+                    self.emit("tunnel_blocked", self.node_pos)
+                    return False
+                self.wait(1.0)                           # let the map catch up
+        return done()
+
     def mine_to_depth(self, target_y, heading=None, timeout=900.0,
                       max_steps=400, defend=True, min_hp=8):
         """Dig a descending staircase until the bot reaches `target_y`.
@@ -791,7 +891,7 @@ class Bot:
                             break
                 if blocked:
                     continue
-                if self.goto(feet, tolerance=0, timeout=20, replan=False):
+                if self.goto(feet, tolerance=0, timeout=20, replan=False, dig=False):
                     hi = (hi + attempt) % len(headings)
                     steps += 1
                     advanced = True
@@ -812,7 +912,7 @@ class Bot:
                 reach = self.pathfinder.explore(self.node_pos, max_expanded=8000)
                 deepest = min(reach, key=lambda q: q[1]) if reach else None
                 if deepest is not None and deepest[1] < p[1]:
-                    if self.goto(deepest, tolerance=1, timeout=60):
+                    if self.goto(deepest, tolerance=1, timeout=60, dig=False):
                         steps += 1
                         advanced = True
                         self.emit("mining_descended", self.node_pos)
@@ -820,7 +920,7 @@ class Bot:
                     hi = (hi + 1) % len(headings)
                     if not self.goto((p[0] + headings[hi][0] * 2, p[1],
                                       p[2] + headings[hi][1] * 2),
-                                     tolerance=1, timeout=15, replan=False):
+                                     tolerance=1, timeout=15, replan=False, dig=False):
                         self.emit("mining_aborted", "boxed in")
                         return False
             if defend and self.hostiles(6):
