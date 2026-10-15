@@ -7,16 +7,42 @@ bot dependency-free.
 """
 import ctypes
 import ctypes.util
+import glob
+import os
 import zlib
 
 _lib = None
 
 
+def _zstd_candidates():
+    """Places libzstd may live: $LUANTI_ZSTD, the system path, and on Windows
+    the copy every Luanti install ships next to luanti.exe."""
+    if os.environ.get("LUANTI_ZSTD"):
+        yield os.environ["LUANTI_ZSTD"]
+    found = ctypes.util.find_library("zstd") or ctypes.util.find_library("libzstd")
+    if found:
+        yield found
+    if os.name == "nt":
+        roots = [os.environ.get("LOCALAPPDATA", ""), os.environ.get("ProgramFiles", ""),
+                 os.environ.get("ProgramFiles(x86)", "")]
+        for root in filter(None, roots):
+            for name in ("luanti", "minetest"):
+                yield from sorted(glob.glob(os.path.join(root, name, "**", "libzstd.dll"),
+                                            recursive=True), reverse=True)
+    yield "libzstd.so.1"
+
+
 def _zstd():
     global _lib
     if _lib is None:
-        path = ctypes.util.find_library("zstd") or "libzstd.so.1"
-        _lib = ctypes.CDLL(path)
+        for path in _zstd_candidates():
+            try:
+                _lib = ctypes.CDLL(path)
+                break
+            except OSError:
+                continue
+        else:
+            raise OSError("libzstd not found; set LUANTI_ZSTD to its path")
         _lib.ZSTD_createDStream.restype = ctypes.c_void_p
         _lib.ZSTD_freeDStream.argtypes = [ctypes.c_void_p]
         _lib.ZSTD_initDStream.argtypes = [ctypes.c_void_p]
